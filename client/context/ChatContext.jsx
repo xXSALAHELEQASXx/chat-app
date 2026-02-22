@@ -1,8 +1,7 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useState, useCallback, useRef } from "react";
 import { AuthContext } from "./AuthContext";
 import toast from "react-hot-toast";
 import assets from "../src/assets/assets";
-
 
 const AI_USER = {
   _id: "AI",
@@ -19,6 +18,7 @@ export const ChatProvider = ({ children }) => {
   const [unseenMessages, setUnseenMessages] = useState({});
 
   const { socket, axios, authUser } = useContext(AuthContext);
+  const saveTimeoutRef = useRef(null);
 
   // Get all users
   const getUsers = async () => {
@@ -43,68 +43,82 @@ export const ChatProvider = ({ children }) => {
     }
   };
 
-  // Send normal message
+  // Send normal message with optimistic UI update
   const sendMessage = async (messageData) => {
     try {
+      // Optimistically add message immediately
+      const optimisticMessage = {
+        senderId: authUser._id,
+        receiverId: selectedUser._id,
+        text: messageData.text,
+        image: messageData.image,
+        createdAt: new Date().toISOString(),
+        _id: `temp-${Date.now()}` // Temporary ID
+      };
+      
+      setMessages(prev => [...prev, optimisticMessage]);
+
+      // Send to backend
       const { data } = await axios.post(`/api/messages/send/${selectedUser._id}`, messageData);
-      if (data.success) setMessages(prev => [...prev, data.newMessage]);
-      else toast.error(data.message);
+      
+      if (data.success) {
+        // Replace optimistic message with real one from server
+        setMessages(prev => 
+          prev.map(msg => 
+            msg._id === optimisticMessage._id ? data.newMessage : msg
+          )
+        );
+      } else {
+        // Remove optimistic message on failure
+        setMessages(prev => prev.filter(msg => msg._id !== optimisticMessage._id));
+        toast.error(data.message);
+      }
     } catch (error) {
+      // Remove optimistic message on error
+      setMessages(prev => prev.filter(msg => msg._id.startsWith('temp-')));
       toast.error(error.message);
     }
   };
 
   // Send message to AI via backend
-const sendMessageToAI = async (text) => {
-  try {
-    console.log("Sending prompt to backend:", text);
+  const sendMessageToAI = async (text) => {
+    try {
+      const response = await fetch("http://localhost:5000/api/ai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: text }),
+      });
 
-    const response = await fetch("http://localhost:5000/api/ai", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt: text }),
-    });
+      if (!response.ok) {
+        toast.error(`Network error: ${response.status}`);
+        return;
+      }
 
-    if (!response.ok) {
-      console.error("Network response was not ok:", response.status, response.statusText);
-      toast.error(`Network error: ${response.status}`);
-      return;
+      const data = await response.json();
+
+      if (!data.success || !data.reply) {
+        toast.error(data.message || "AI response failed");
+        return;
+      }
+
+      // Add AI response to messages
+      const aiMessage = {
+        senderId: "AI",
+        receiverId: authUser._id,
+        text: data.reply,
+        createdAt: new Date().toISOString(),
+      };
+
+      setMessages((prev) => [...prev, aiMessage]);
+
+    } catch (error) {
+      console.error("AI message error:", error);
+      toast.error("Failed to get AI response");
     }
-
-    const data = await response.json();
-    console.log("Raw AI response from backend:", data);
-
-    if (!data.success) {
-      console.warn("Backend returned success=false:", data);
-      toast.error(data.message || "AI response failed");
-      return;
-    }
-
-    if (!data.reply) {
-      console.warn("Backend success=true but no reply field found:", data);
-      toast.error("AI response empty");
-      return;
-    }
-
-    // Add AI response to messages
-    const aiMessage = {
-      senderId: "AI",
-      receiverId: authUser._id,
-      text: data.reply,
-      createdAt: new Date().toISOString(),
-    };
-
-    console.log("Adding AI message to chat:", aiMessage);
-    setMessages((prev) => [...prev, aiMessage]);
-
-  } catch (error) {
-    console.error("AI message error:", error);
-    toast.error("Failed to get AI response");
-  }
-};
+  };
 
   // Subscribe to messages
-  const subscribeToMessages = () => {
+  const subscribeToMessages = useCallback(() => {
     if (!socket) return;
 
     socket.on("newMessage", (newMessage) => {
@@ -119,34 +133,51 @@ const sendMessageToAI = async (text) => {
         }));
       }
     });
-  };
+  }, [socket, selectedUser, axios]);
 
-  const unsubscribeFromMessages = () => {
+  const unsubscribeFromMessages = useCallback(() => {
     if (socket) socket.off("newMessage");
-  };
+  }, [socket]);
 
   useEffect(() => {
     subscribeToMessages();
     return () => unsubscribeFromMessages();
-  }, [socket, selectedUser]);
+  }, [subscribeToMessages, unsubscribeFromMessages]);
 
-  // 🧠 Save and load AI chat messages locally
-useEffect(() => {
-  // Load saved AI messages when opening AI chat
-  if (selectedUser?._id === "AI") {
-    const savedAIChat = localStorage.getItem("ai_chat");
-    if (savedAIChat) {
-      setMessages(JSON.parse(savedAIChat));
+  // Load AI messages when opening AI chat
+  useEffect(() => {
+    if (selectedUser?._id === "AI") {
+      const savedAIChat = localStorage.getItem("ai_chat");
+      if (savedAIChat) {
+        try {
+          setMessages(JSON.parse(savedAIChat));
+        } catch (error) {
+          console.error("Failed to load AI chat:", error);
+        }
+      }
     }
-  }
-}, [selectedUser]);
+  }, [selectedUser]);
 
-useEffect(() => {
-  // Save AI chat messages whenever they change
-  if (selectedUser?._id === "AI") {
-    localStorage.setItem("ai_chat", JSON.stringify(messages));
-  }
-}, [messages, selectedUser]);
+  // Debounced save to localStorage (only for AI chat)
+  useEffect(() => {
+    if (selectedUser?._id === "AI" && messages.length > 0) {
+      // Clear previous timeout
+      if (saveTimeoutRef.current) {
+        clearTimeout(saveTimeoutRef.current);
+      }
+      
+      // Save after 500ms of no changes (debounced)
+      saveTimeoutRef.current = setTimeout(() => {
+        localStorage.setItem("ai_chat", JSON.stringify(messages));
+      }, 500);
+    }
+
+    return () => {
+      if (saveTimeoutRef.current) {
+        clearTimeout(saveTimeoutRef.current);
+      }
+    };
+  }, [messages, selectedUser]);
 
   return (
     <ChatContext.Provider value={{
